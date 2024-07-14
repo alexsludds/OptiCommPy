@@ -133,6 +133,83 @@ def mzm(Ai, u, param=None):
     return Ai * np.cos(0.5 / Vpi * (u + Vb) * π)
 
 
+def ring_modulator(Ai,u, param=None):
+    """
+    Optical ring modulator.
+
+    Parameters
+    ----------
+    Ai : scalar or np.array
+        Amplitude of the optical field at the input of the MZM.
+    u : np.array
+        Electrical driving signal.
+    param : parameter object  (struct)
+        Object with physical/simulation parameters of the mzm.
+
+        - param.Ts: Sampling period, required for keeping time and frequency domain in check (default 10ps)
+
+        - param.radius: Ring radius (default 10um)
+
+        - param.ng: Ring group index (default 4.2)
+
+        - param.coupling: Ring bus power coupling (default 0.16)
+
+        - param.loss_rate: Ring loss rate in dB/meter (default 5000)
+
+        - param.detuning: Detuning from resonance in Hz (default -30 GHz)
+
+        - param.EO_efficiency: rings detuning efficiency in units of Hertz / volt (default 40 GHz/V)
+
+    Returns
+    -------
+    Ao : np.array
+        Modulated optical field at the output of the MZM.
+
+    References
+    ----------
+    [1] L. Zhang, Silicon-Based Microring Resonator Modulators for Intensity Modulation. IEEE JSTQE, 2010.
+
+    """
+    if param is None:
+        param = []
+
+    # check input parameters
+    Ts = getattr(param, "Ts", 10e-12)
+    radius = getattr(param, "radius", 10e-6)
+    ng = getattr(param, "ng", 4.2)
+    coupling = getattr(param, "coupling", 0.12)
+    loss_rate = getattr(param, "loss_rate", 3000)
+    detuning = getattr(param, "detuning", -40e9)
+    EO_efficiency = getattr(param,"EO_efficiency",40e9)
+
+    try:
+        u.shape
+    except AttributeError:
+        u = np.array([u])
+
+    try:
+        if Ai.shape == () and u.shape != ():
+            Ai = Ai * np.ones(u.shape)
+        else:
+            assert Ai.shape == u.shape, "Ai and u need to have the same dimensions"
+    except AttributeError:
+        Ai = Ai * np.ones(u.shape)
+
+    tauL = ng * 4.34 /(const.c * loss_rate)
+    mu = np.sqrt(coupling * const.c/ng/(2*np.pi*radius))
+    tauC = 2/mu**2
+    
+    output = []
+    for index in range(u.size):
+        deltaf = EO_efficiency * u[index]
+        delta_omega = 2*np.pi*(detuning + deltaf)
+        num = 1j*(delta_omega) - 1/tauL - 1/tauC + mu**2
+        denom = 1j*(delta_omega) - 1/tauL - 1/tauC
+        output.append(num/denom * Ai[index])
+    output = np.array(output)
+    return output
+
+
 def iqm(Ai, u, param=None):
     """
     Optical In-Phase/Quadrature Modulator (IQM).
