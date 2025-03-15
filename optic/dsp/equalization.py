@@ -8,8 +8,8 @@ DSP algorithms for equalization (:mod:`optic.dsp.equalization`)
 
    edc                 -- Electronic chromatic dispersion compensation (EDC)
    mimoAdaptEqualizer  -- General N-by-N MIMO adaptive equalizer with several adaptive filtering algorithms available.
+   manakovDBP          -- Manakov SSF digital backpropagation (DBP) algorithm
 """
-
 
 """Functions for adaptive and static equalization."""
 import logging as logg
@@ -19,9 +19,14 @@ import scipy.constants as const
 from numba import njit
 from numpy.fft import fft, fftfreq, ifft
 from tqdm.notebook import tqdm
-from optic.dsp.core import pnorm
-from optic.models.channels import linearFiberChannel
+from optic.dsp.core import pnorm, blockwiseFFTConv
 from optic.comm.modulation import grayMapping
+from optic.models.channels import nlinPhaseRot, convergenceCondition
+
+# try:
+#     from optic.dsp.coreGPU import blockwiseFFTConv
+# except ImportError:
+#     from optic.dsp.core import blockwiseFFTConv
 
 
 def edc(Ei, param):
@@ -43,6 +48,12 @@ def edc(Ei, param):
 
         - param.Fs: sampling frequency [Hz] [default: []]
 
+        - param.Rs: symbol rate [baud] [default: 32e9]
+
+        - param.NfilterCoeffs: number of filter coefficients [default: []]
+
+        - param.Nfft: FFT size [default: []]
+
     Returns
     -------
     np.array
@@ -61,22 +72,56 @@ def edc(Ei, param):
     except AttributeError:
         logg.error("Simulation sampling frequency (Fs) not provided.")
 
+    try:
+        nModes = Ei.shape[1]
+    except IndexError:
+        nModes = 1
+        Ei = Ei.reshape(Ei.size, nModes)
+
     # check input parameters
-    param.L = getattr(param, "L", 50)
-    param.D = getattr(param, "D", 16)
-    param.Fc = getattr(param, "Fc", 193.1e12)
+    L = getattr(param, "L", 50)
+    D = getattr(param, "D", 16)
+    Fc = getattr(param, "Fc", 193.1e12)
+    Rs = getattr(param, "Rs", 32e9)
+    NfilterCoeffs = getattr(param, "NfilterCoeffs", None)
+    Nfft = getattr(param, "Nfft", None)
 
-    param.alpha = 0
-    param.D = -param.D
+    # c  = 299792458   # speed of light [m/s](vacuum)
+    c_kms = const.c / 1e3
+    λ = c_kms / Fc
+    β2 = -(D * λ**2) / (2 * np.pi * c_kms)
+
+    # If number of filter coefficients is not provided, calculate it
+    # based on the dispersion parameter, the fiber length and the symbol rate
+    if NfilterCoeffs is None:
+        NfilterCoeffs = int(2 * np.ceil(6.67 * np.abs(β2) * L * Rs**2 * (Fs / Rs)))
+
+    # If FFT size is not provided, calculate it based on the number of filter coefficients
+    if Nfft is None:
+        Nfft = 2 ** int(np.ceil(np.log2(NfilterCoeffs)))
+
+    ω = 2 * np.pi * Fs * fftfreq(NfilterCoeffs)  # angular frequency vector
+
+    H = np.exp(-1j * (β2 / 2) * (ω**2) * L)  # frequency response of the CD filter
+
     logg.info(f"Running CD compensation...")
+    logg.info(f"CD filter length: {NfilterCoeffs} taps, FFT size: {Nfft}")
 
-    return linearFiberChannel(Ei, param)
+    Eo = np.zeros(Ei.shape, dtype=Ei.dtype)
+
+    # Apply CD compensation to each mode
+    for indMode in range(nModes):
+        Eo[:, indMode] = blockwiseFFTConv(
+            Ei[:, indMode], H, NFFT=Nfft, freqDomainFilter=True
+        )
+
+    return Eo
 
 
 def mimoAdaptEqualizer(x, param=None, dx=None):
     """
     N-by-N MIMO adaptive equalizer.
-    
+
     Parameters
     ----------
     x : np.array
@@ -197,12 +242,11 @@ def mimoAdaptEqualizer(x, param=None, dx=None):
         H = np.zeros((nModes**2, nTaps), dtype="complex")
 
         for initH in range(nModes):  # initialize filters' taps
-            H[
-                initH + initH * nModes, int(np.floor(H.shape[1] / 2))
-            ] = 1  # Central spike initialization
-    if not H_:  # if H_ is not defined      
+            H[initH + initH * nModes, int(np.floor(H.shape[1] / 2))] = (
+                1  # Central spike initialization
+            )
+    if not H_:  # if H_ is not defined
         H_ = np.zeros((nModes**2, nTaps), dtype="complex")
-
 
     logg.info(f"Running adaptive equalizer...")
     # Equalizer training:
@@ -221,20 +265,22 @@ def mimoAdaptEqualizer(x, param=None, dx=None):
                     logg.info(
                         f"{runAlg} pre-convergence training iteration #%d", indIter
                     )
-                    yEq[nStart:nEnd, :], H, H_, errSq[:, nStart:nEnd], Hiter = coreAdaptEq(
-                        x[nStart * SpS : (nEnd + 2 * Lpad) * SpS, :],
-                        dx[nStart:nEnd, :],
-                        SpS,
-                        H,
-                        H_,
-                        L[indstage],
-                        mu[indstage],
-                        lambdaRLS,
-                        nTaps,
-                        storeCoeff,
-                        runWL,
-                        runAlg,
-                        constSymb,
+                    yEq[nStart:nEnd, :], H, H_, errSq[:, nStart:nEnd], Hiter = (
+                        coreAdaptEq(
+                            x[nStart * SpS : (nEnd + 2 * Lpad) * SpS, :],
+                            dx[nStart:nEnd, :],
+                            SpS,
+                            H,
+                            H_,
+                            L[indstage],
+                            mu[indstage],
+                            lambdaRLS,
+                            nTaps,
+                            storeCoeff,
+                            runWL,
+                            runAlg,
+                            constSymb,
+                        )
                     )
                     logg.info(
                         f"{runAlg} MSE = %.6f.", np.nanmean(errSq[:, nStart:nEnd])
@@ -268,14 +314,16 @@ def mimoAdaptEqualizer(x, param=None, dx=None):
     if returnResults:
         if runWL:
             return yEq, H, H_, errSq, Hiter
-        else: 
+        else:
             return yEq, H, errSq, Hiter
     else:
         return yEq
 
 
 @njit
-def coreAdaptEq(x, dx, SpS, H, H_, L, mu, lambdaRLS, nTaps, storeCoeff, runWL, alg, constSymb):
+def coreAdaptEq(
+    x, dx, SpS, H, H_, L, mu, lambdaRLS, nTaps, storeCoeff, runWL, alg, constSymb
+):
     """
     Adaptive equalizer core processing function
 
@@ -367,8 +415,8 @@ def coreAdaptEq(x, dx, SpS, H, H_, L, mu, lambdaRLS, nTaps, storeCoeff, runWL, a
                 H[indMode + N * nModes, :] @ inEq
             )  # add contribution from the Nth mode to the equalizer's output
             if runWL:
-                outEq += (
-                    H_[indMode + N * nModes, :] @ np.conj(inEq)
+                outEq += H_[indMode + N * nModes, :] @ np.conj(
+                    inEq
                 )  # add augmented contribution from the Nth mode to the equalizer's output
 
         yEq[ind, :] = outEq.T
@@ -376,15 +424,25 @@ def coreAdaptEq(x, dx, SpS, H, H_, L, mu, lambdaRLS, nTaps, storeCoeff, runWL, a
         # update equalizer taps acording to the specified
         # algorithm and save squared error:
         if alg == "nlms":
-            H, H_, errSq[:, ind] = nlmsUp(x[indIn, :], dx[ind, :], outEq, mu, H, H_, nModes, runWL)
+            H, H_, errSq[:, ind] = nlmsUp(
+                x[indIn, :], dx[ind, :], outEq, mu, H, H_, nModes, runWL
+            )
         elif alg == "cma":
-            H, H_, errSq[:, ind] = cmaUp(x[indIn, :], Rcma, outEq, mu, H, H_, nModes, runWL)
+            H, H_, errSq[:, ind] = cmaUp(
+                x[indIn, :], Rcma, outEq, mu, H, H_, nModes, runWL
+            )
         elif alg == "dd-lms":
-            H, H_, errSq[:, ind] = ddlmsUp(x[indIn, :], constSymb, outEq, mu, H, H_, nModes, runWL)
+            H, H_, errSq[:, ind] = ddlmsUp(
+                x[indIn, :], constSymb, outEq, mu, H, H_, nModes, runWL
+            )
         elif alg == "rde":
-            H, H_, errSq[:, ind] = rdeUp(x[indIn, :], Rrde, outEq, mu, H, H_, nModes, runWL)
+            H, H_, errSq[:, ind] = rdeUp(
+                x[indIn, :], Rrde, outEq, mu, H, H_, nModes, runWL
+            )
         elif alg == "da-rde":
-            H, H_, errSq[:, ind] = dardeUp(x[indIn, :], dx[ind, :], outEq, mu, H, H_, nModes, runWL)
+            H, H_, errSq[:, ind] = dardeUp(
+                x[indIn, :], dx[ind, :], outEq, mu, H, H_, nModes, runWL
+            )
         elif alg == "rls":
             H, Sd, errSq[:, ind] = rlsUp(
                 x[indIn, :], dx[ind, :], outEq, lambdaRLS, H, Sd, nModes
@@ -457,10 +515,9 @@ def nlmsUp(x, dx, outEq, mu, H, H_, nModes, runWL):
             mu * errDiag @ np.conj(inAdaptPar)
         )  # gradient descent update
         if runWL:
-            H_[indUpdTaps, :] += (
-                mu * errDiag @ inAdaptPar
-            )  # gradient descent update
+            H_[indUpdTaps, :] += mu * errDiag @ inAdaptPar  # gradient descent update
     return H, H_, np.abs(err) ** 2
+
 
 @njit
 def rlsUp(x, dx, outEq, λ, H, Sd, nModes):
@@ -580,11 +637,9 @@ def ddlmsUp(x, constSymb, outEq, mu, H, H_, nModes, runWL):
         )  # expand input to parallelize tap adaptation
         H[indUpdTaps, :] += (
             mu * errDiag @ np.conj(inAdaptPar)
-        )  # gradient descent update        
+        )  # gradient descent update
         if runWL:
-            H_[indUpdTaps, :] += (
-                mu * errDiag @ inAdaptPar
-            )  # gradient descent update   
+            H_[indUpdTaps, :] += mu * errDiag @ inAdaptPar  # gradient descent update
     return H, H_, np.abs(err) ** 2
 
 
@@ -709,9 +764,7 @@ def cmaUp(x, R, outEq, mu, H, H_, nModes, runWL):
             mu * prodErrOut @ np.conj(inAdaptPar)
         )  # gradient descent update
         if runWL:
-            H_[indUpdTaps, :] += (
-            mu * prodErrOut @ inAdaptPar
-            )  # gradient descent update
+            H_[indUpdTaps, :] += mu * prodErrOut @ inAdaptPar  # gradient descent update
     return H, H_, np.abs(err) ** 2
 
 
@@ -774,9 +827,7 @@ def rdeUp(x, R, outEq, mu, H, H_, nModes, runWL):
             mu * prodErrOut @ np.conj(inAdaptPar)
         )  # gradient descent update
         if runWL:
-            H_[indUpdTaps, :] += (
-            mu * prodErrOut @ inAdaptPar
-            )  # gradient descent update
+            H_[indUpdTaps, :] += mu * prodErrOut @ inAdaptPar  # gradient descent update
 
     return H, H_, np.abs(err) ** 2
 
@@ -839,65 +890,221 @@ def dardeUp(x, dx, outEq, mu, H, H_, nModes, runWL):
             mu * prodErrOut @ np.conj(inAdaptPar)
         )  # gradient descent update
         if runWL:
-            H_[indUpdTaps, :] += (
-            mu * prodErrOut @ inAdaptPar
-            )  # gradient descent update
+            H_[indUpdTaps, :] += mu * prodErrOut @ inAdaptPar  # gradient descent update
     return H, H_, np.abs(err) ** 2
 
 
-def dbp(Ei, Fs, Ltotal, Lspan, hz=0.5, alpha=0.2, gamma=1.3, D=16, Fc=193.1e12):
+def manakovDBP(Ei, param):
     """
-    Digital backpropagation (symmetric, single-pol.)
+    Run the Manakov SSF digital backpropagation (symmetric, dual-pol.).
 
-    :param Ei: input signal
-    :param Ltotal: total fiber length [km]
-    :param Lspan: span length [km]
-    :param hz: step-size for the split-step Fourier method [km][default: 0.5 km]
-    :param alpha: fiber attenuation parameter [dB/km][default: 0.2 dB/km]
-    :param D: chromatic dispersion parameter [ps/nm/km][default: 16 ps/nm/km]
-    :param gamma: fiber nonlinear parameter [1/W/km][default: 1.3 1/W/km]
-    :param Fc: carrier frequency [Hz][default: 193.1e12 Hz]
-    :param Fs: sampling frequency [Hz]
+    Parameters
+    ----------
+    Ei : np.array
+        Input optical signal field.
+    param : parameter object  (struct)
+        Object with physical/simulation parameters of the optical channel.
 
-    :return Ech: backpropagated signal
+        - param.Ltotal: total fiber length [km][default: 400 km]
+
+        - param.Lspan: span length [km][default: 80 km]
+
+        - param.hz: step-size for the split-step Fourier method [km][default: 0.5 km]
+
+        - param.alpha: fiber attenuation parameter [dB/km][default: 0.2 dB/km]
+
+        - param.D: chromatic dispersion parameter [ps/nm/km][default: 16 ps/nm/km]
+
+        - param.gamma: fiber nonlinear parameter [1/W/km][default: 1.3 1/W/km]
+
+        - param.Fc: carrier frequency [Hz] [default: 193.1e12 Hz]
+
+        - param.Fs: simulation sampling frequency [samples/second][default: None]
+
+        - param.prec: numerical precision [default: np.complex128]
+
+        - param.amp: 'edfa', 'ideal', or 'None. [default:'edfa']
+
+        - param.maxIter: max number of iter. in the trap. integration [default: 10]
+
+        - param.tol: convergence tol. of the trap. integration.[default: 1e-5]
+
+        - param.nlprMethod: adap step-size based on nonl. phase rot. [default: True]
+
+        - param.maxNlinPhaseRot: max nonl. phase rot. tolerance [rad][default: 2e-2]
+
+        - param.prgsBar: display progress bar? bolean variable [default:True]
+
+        - param.saveSpanN: specify the span indexes to be outputted [default:[]]
+
+        - param.returnParameters: bool, return channel parameters [default: False]
+
+
+    Returns
+    -------
+    Ech : np.array
+        Optical signal after nonlinear backward propagation.
+    param : parameter object  (struct)
+        Object with physical/simulation parameters used in the split-step alg.
+
+    References
+    ----------
+    [1] E. Ip e J. M. Kahn, “Compensation of dispersion and nonlinear impairments using digital backpropagation”, Journal of Lightwave Technology, vol. 26, nº 20, p. 3416–3425, 2008, doi: 10.1109/JLT.2008.927791.
+
+    [2] E. Ip, “Nonlinear compensation using backpropagation for polarization-multiplexed transmission”, Journal of Lightwave Technology, vol. 28, nº 6, p. 939–951, mar. 2010, doi: 10.1109/JLT.2010.2040135.
+
     """
-    # c = 299792458   # speed of light (vacuum)
-    c_kms = const.c / 1e3
-    λ = c_kms / Fc
-    α = -alpha / (10 * np.log10(np.exp(1)))
-    β2 = (D * λ**2) / (2 * np.pi * c_kms)
-    γ = -gamma
+    try:
+        Fs = param.Fs
+    except AttributeError:
+        logg.error("Simulation sampling frequency (Fs) not provided.")
 
-    Nfft = len(Ei)
+    # check input parameters
+    param.Ltotal = getattr(param, "Ltotal", 400)
+    param.Lspan = getattr(param, "Lspan", 80)
+    param.hz = getattr(param, "hz", 0.5)
+    param.alpha = getattr(param, "alpha", 0.2)
+    param.D = getattr(param, "D", 16)
+    param.gamma = getattr(param, "gamma", 1.3)
+    param.Fc = getattr(param, "Fc", 193.1e12)
+    param.prec = getattr(param, "prec", np.complex128)
+    param.amp = getattr(param, "amp", "edfa")
+    param.maxIter = getattr(param, "maxIter", 10)
+    param.tol = getattr(param, "tol", 1e-5)
+    param.nlprMethod = getattr(param, "nlprMethod", True)
+    param.maxNlinPhaseRot = getattr(param, "maxNlinPhaseRot", 2e-2)
+    param.prgsBar = getattr(param, "prgsBar", True)
+    param.saveSpanN = getattr(param, "saveSpanN", [param.Ltotal // param.Lspan])
+    param.returnParameters = getattr(param, "returnParameters", False)
 
-    ω = 2 * np.pi * Fs * fftfreq(Nfft)
+    Ltotal = param.Ltotal
+    Lspan = param.Lspan
+    hz = param.hz
+    alpha = param.alpha
+    D = param.D
+    gamma = param.gamma
+    amp = param.amp
+    Fc = param.Fc
+    prec = param.prec
+    maxIter = param.maxIter
+    tol = param.tol
+    prgsBar = param.prgsBar
+    saveSpanN = param.saveSpanN
+    nlprMethod = param.nlprMethod
+    maxNlinPhaseRot = param.maxNlinPhaseRot
+    returnParameters = param.returnParameters
 
     Nspans = int(np.floor(Ltotal / Lspan))
-    Nsteps = int(np.floor(Lspan / hz))
 
-    Ech = Ei.reshape(
-        len(Ei),
-    )
-    Ech = fft(Ech)  # single-polarization field
+    # channel parameters
+    c_kms = const.c / 1e3  # speed of light (vacuum) in km/s
+    λ = c_kms / Fc
+    α = alpha / (10 * np.log10(np.exp(1)))
+    β2 = -(D * λ**2) / (2 * np.pi * c_kms)
+    γ = gamma
 
-    linOperator = np.exp(-(α / 2) * (hz / 2) + 1j * (β2 / 2) * (ω**2) * (hz / 2))
+    # generate frequency axis
+    Nfft = len(Ei)
+    ω = 2 * np.pi * Fs * fftfreq(Nfft).astype(prec)
+  
+    Ech_x = Ei[:, 0::2].T
+    Ech_y = Ei[:, 1::2].T
 
-    for _ in tqdm(range(Nspans)):
-        Ech = Ech * np.exp((α / 2) * Nsteps * hz)
+    # define static part of the linear operator
+    argLimOp = np.array((α / 2) - 1j * (β2 / 2) * (ω**2)).astype(prec)
 
-        for _ in range(Nsteps):
+    if Ech_x.shape[0] > 1:
+        argLimOp = np.tile(argLimOp, (Ech_x.shape[0], 1))
+    else:
+        argLimOp = argLimOp.reshape(1, -1)
+
+    if saveSpanN:
+        Ech_spans = np.zeros((Ei.shape[0], Ei.shape[1] * len(saveSpanN))).astype(prec)
+        indRecSpan = 0
+
+    for spanN in tqdm(range(1, Nspans + 1), disable=not (prgsBar)):
+        # reverse amplification step
+        if amp in {"edfa", "ideal"}:
+            Ech_x = Ech_x * np.exp(-α / 2 * Lspan)
+            Ech_y = Ech_y * np.exp(-α / 2 * Lspan)
+        elif amp is None:
+            Ech_x = Ech_x * np.exp(0)
+            Ech_y = Ech_y * np.exp(0)
+
+        Ex_conv = Ech_x.copy()
+        Ey_conv = Ech_y.copy()
+        z_current = 0
+
+        # reverse fiber propagation steps
+        while z_current < Lspan:
+            Pch = Ech_x * np.conj(Ech_x) + Ech_y * np.conj(Ech_y)
+
+            phiRot = nlinPhaseRot(Ex_conv, Ey_conv, Pch, γ)
+
+            if nlprMethod:
+                hz_ = (
+                    maxNlinPhaseRot / np.max(phiRot)
+                    if Lspan - z_current >= maxNlinPhaseRot / np.max(phiRot)
+                    else Lspan - z_current
+                )
+            elif Lspan - z_current < hz:
+                hz_ = Lspan - z_current  # check that the remaining
+                # distance is not less than hz (due to non-integer
+                # steps/span)
+            else:
+                hz_ = hz
+
+            # define the linear operator
+            linOperator = np.exp(argLimOp * (hz_ / 2))
+
             # First linear step (frequency domain)
-            Ech = Ech * linOperator
+            Ex_hd = ifft(fft(Ech_x) * linOperator)
+            Ey_hd = ifft(fft(Ech_y) * linOperator)
 
             # Nonlinear step (time domain)
-            Ech = ifft(Ech)
-            Ech = Ech * np.exp(1j * γ * (Ech * np.conj(Ech)) * hz)
+            for nIter in range(maxIter):
+                rotOperator = np.exp(-1j * phiRot * hz_)
 
-            # Second linear step (frequency domain)
-            Ech = fft(Ech)
-            Ech = Ech * linOperator
-    Ech = ifft(Ech)
+                Ech_x_fd = Ex_hd * rotOperator
+                Ech_y_fd = Ey_hd * rotOperator
 
-    return Ech.reshape(
-        len(Ech),
-    )
+                # Second linear step (frequency domain)
+                Ech_x_fd = ifft(fft(Ech_x_fd) * linOperator)
+                Ech_y_fd = ifft(fft(Ech_y_fd) * linOperator)
+
+                # check convergence o trapezoidal integration in phiRot
+                lim = convergenceCondition(Ech_x_fd, Ech_y_fd, Ex_conv, Ey_conv)
+
+                Ex_conv = Ech_x_fd.copy()
+                Ey_conv = Ech_y_fd.copy()
+
+                if lim < tol:
+                    break
+                elif nIter == maxIter - 1:
+                    logg.warning(
+                        f"Warning: target SSFM error tolerance was not achieved in {maxIter} iterations"
+                    )
+
+                phiRot = nlinPhaseRot(Ex_conv, Ey_conv, Pch, γ)
+
+            Ech_x = Ech_x_fd.copy()
+            Ech_y = Ech_y_fd.copy()
+
+            z_current += hz_  # update propagated distance
+
+        if spanN in saveSpanN:
+            Ech_spans[:, 2 * indRecSpan : 2 * indRecSpan + 1] = Ech_x.T
+            Ech_spans[:, 2 * indRecSpan + 1 : 2 * indRecSpan + 2] = Ech_y.T
+            indRecSpan += 1
+
+    if saveSpanN:
+        Ech = Ech_spans
+    else:
+        Ech_x = Ech_x
+        Ech_y = Ech_y
+
+        Ech = Ei.copy()
+        Ech[:, 0::2] = Ech_x.T
+        Ech[:, 1::2] = Ech_y.T
+
+    return (Ech, param) if returnParameters else Ech

@@ -23,6 +23,15 @@ from numpy.fft import fft, fftfreq, fftshift
 from optic.dsp.core import pnorm, movingAverage
 from optic.comm.modulation import grayMapping
 
+try:
+    from optic.dsp.coreGPU import checkGPU
+    if checkGPU():
+        from optic.dsp.carrierRecoveryGPU import bpsGPU 
+    else:
+        pass        
+except ImportError:
+    pass
+
 
 def cpr(Ei, param=None, symbTx=None):
     """
@@ -35,7 +44,7 @@ def cpr(Ei, param=None, symbTx=None):
     param : core.param object, optional
         configuration parameters. The default is [].
 
-        - param.alg: CPR algorithm to be used ['bps', 'ddpll', or 'viterbi']
+        - param.alg: CPR algorithm to be used ['bps', 'bpsGPU', 'ddpll', or 'viterbi']
 
         BPS params:
 
@@ -123,6 +132,13 @@ def cpr(Ei, param=None, symbTx=None):
     elif alg == "bps":
         logg.info(f"Running BPS carrier phase recovery...")
         θ = bps(Ei, N // 2, constSymb, B)
+    elif alg == "bpsGPU": 
+        try:
+            logg.info("Running GPU-based BPS carrier phase recovery...")
+            θ = bpsGPU(Ei, N // 2, constSymb, B)
+        except NameError:
+            logg.warning("GPU unavailable, switching to CPU processing...")
+            θ = bps(Ei, N // 2, constSymb, B)
     elif alg == "viterbi":
         logg.info(f"Running Viterbi&Viterbi carrier phase recovery...")
         θ = viterbi(Ei, N)
